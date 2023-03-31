@@ -1,0 +1,225 @@
+---
+output:
+  html_notebook:
+#  pdf_document:
+#  latex_engine: xelatex
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+library(rhdf5)
+library(tidyverse)
+library(dplyr)
+
+# Define measurement names
+measurements <- c("al_h", "c_h", "ca_h", "fe_h", "mg_h", "n_h", "o_h")
+measurement_errs <- paste0(measurements, "_err")
+
+# Define a function to extract and rename data
+extract_and_rename <- function(name) {
+  data <- h5read("STA130_APOGEE.h5", name) %>% as_tibble()
+  colnames(data) <- paste0(name, " ")
+  return(data)
+}
+
+# Use "lapply" to extract and rename data for each measurement
+h <- lapply(measurements, extract_and_rename)
+err <- lapply(measurement_errs, extract_and_rename)
+
+# Combine the data frames using bind_cols
+df_h <- bind_cols(h) %>% select(-ends_with("_h"))
+df_err <- bind_cols(err) %>% select(-ends_with("_err"))
+
+apogee_spectra <- "STA130_APOGEE.h5" %>% h5read("spectra") %>% as_tibble()
+
+# calculate the mean of each column in the "spectra" data set
+means <- colMeans(apogee_spectra) %>% as_tibble()
+
+df <- bind_cols(df_h, df_err, means)
+names(df) <- c("aluminum", "carbon", "calcium", 
+               "iron", "magnesium", "nitrogen", "oxygen",
+               "aluminum_err", "carbon_err", "calcium_err", 
+               "iron_err", "magnesium_err", "nitrogen_err", "oxygen_err", "intensity")
+df
+```
+
+**VISUALIZATION 1**
+```{r}
+install.packages("patchwork", repos = "http://cran.us.r-project.org")
+library(patchwork)
+library(ggplot2)
+library(ggthemes)
+
+plots <- list()
+
+for (measurement in c("aluminum", "carbon", "calcium", 
+               "iron", "magnesium", "nitrogen", "oxygen")) {
+  p <- df %>%
+    ggplot() + 
+    aes(x = intensity, y = !!sym(measurement)) +
+    labs(x = "Intensity") +
+    geom_bin_2d() +
+    theme_gdocs() +
+    geom_smooth(method = "lm", color = "pink")
+  plots[[measurement]] <- p}
+
+# plotting them all together
+plots$aluminum + plots$carbon + plots$calcium + plots$iron + plots$magnesium + plots$nitrogen + plots$oxygen
+```
+
+```{r}
+set.seed(203)
+# create training and testing data sets
+indexSet <- sample(nrow(df), nrow(df)*0.8)
+train <- df[indexSet,]
+test <- df[-indexSet,]
+
+range <- tibble(range(train$aluminum),range(train$carbon),
+                range(train$calcium), range(train$iron),
+                range(train$magnesium),range(train$nitrogen),
+                range(train$oxygen))
+names(range) <- c("aluminum", "carbon", "calcium", 
+               "iron", "magnesium", "nitrogen", "oxygen")
+range
+
+train
+test
+```
+
+**VISUALIZATION 2**
+```{r}
+install.packages("lmtest", repos = "http://cran.us.r-project.org")
+library(lmtest)
+
+rplot <- list()
+par(mfrow = c(3, 3))
+for (col in colnames(train)[1:7]) {
+  # create the simple linear model
+  model <- lm(paste(col, "~ intensity"), data = train)
+  p <- ggplot() +
+    aes(x=fitted(model), y=resid(model)) +
+    labs(title=col,x="Fitted Values", y="Residuals") +
+    geom_bin_2d() +
+    theme_gdocs()
+  rplot[[col]] <- p} 
+
+#plot(fitted(model), resid(model), main = col, xlab = "Fitted Values", ylab = "Residuals")
+#abline(h = 0)
+
+rplot$aluminum + rplot$carbon + rplot$calcium + rplot$iron + rplot$magnesium + rplot$nitrogen + rplot$oxygen
+```
+
+```{r}
+# Fit linear regression model; Weighted Least Squares Regression (WLS)
+# Then get the summary of each model
+cols <- c("aluminum", "carbon", "calcium", "iron", "magnesium", "nitrogen", "oxygen")
+models <- list()
+for (col in cols) {
+  formula <- as.formula(paste(col, "~ intensity"))
+  weight_col <- paste(col, "_err", sep = "")
+  weight <- 1 / (train[[weight_col]] ^ 2)
+  models[[col]] <- lm(formula, data = train, weights = weight)
+  print(summary(models[[col]]))
+}
+```
+
+```{r}
+test <- test %>%
+  mutate(pred_value_aluminum = predict(models$aluminum, newdata=test),
+         residual_aluminum = aluminum - pred_value_aluminum,
+         pred_value_carbon = predict(models$carbon, newdata=test),
+         residual_carbon = carbon - pred_value_carbon,
+         pred_value_calcium = predict(models$calcium, newdata=test),
+         residual_calcium = calcium - pred_value_calcium,
+         pred_value_iron = predict(models$iron, newdata=test),
+         residual_iron = iron - pred_value_iron,
+         pred_value_magnesium = predict(models$magnesium, newdata=test),
+         residual_magnesium = magnesium - pred_value_magnesium,
+         pred_value_nitrogen = predict(models$nitrogen, newdata=test),
+         residual_nitrogen = nitrogen - pred_value_nitrogen,
+         pred_value_oxygen = predict(models$oxygen, newdata=test),
+         residual_oxygen = oxygen - pred_value_oxygen)
+
+test
+```
+
+**VISUALIZATION 3**
+```{r}
+install.packages("Metrics", repos = "http://cran.us.r-project.org")
+library(Metrics)
+# find correlation between actual and predicted values for each element
+cor_al <- cor(test$aluminum, test$pred_value_aluminum)
+cor_c <- cor(test$carbon, test$pred_value_carbon)
+cor_ca <- cor(test$calcium, test$pred_value_calcium)
+cor_fe <- cor(test$iron, test$pred_value_iron)
+cor_mg <- cor(test$magnesium, test$pred_value_magnesium)
+cor_n <- cor(test$nitrogen, test$pred_value_nitrogen)
+cor_o <- cor(test$oxygen, test$pred_value_oxygen)
+
+sd_train <- list()
+for (col in cols) {
+  sd_train[[col]] <- sd(residuals(models[[col]]))}
+
+test %>% 
+  summarize(correlation = c(cor_al, cor_c, cor_ca, cor_fe, cor_mg, cor_n, cor_o)) %>%
+  mutate(R_squared_testing = c(correlation^2),
+         mean_squared_error = c(mse(test$aluminum, test$pred_value_aluminum),
+                                mse(test$carbon, test$pred_value_carbon),
+                                mse(test$calcium, test$pred_value_calcium),
+                                mse(test$iron, test$pred_value_iron),
+                                mse(test$magnesium, test$pred_value_magnesium),
+                                mse(test$nitrogen, test$pred_value_nitrogen),
+                                mse(test$oxygen, test$pred_value_oxygen)),
+         root_mse = c(rmse(test$aluminum, test$pred_value_aluminum),
+                      rmse(test$carbon, test$pred_value_carbon),
+                      rmse(test$calcium, test$pred_value_calcium),
+                      rmse(test$iron, test$pred_value_iron),
+                      rmse(test$magnesium, test$pred_value_magnesium),
+                      rmse(test$nitrogen, test$pred_value_nitrogen),
+                      rmse(test$oxygen, test$pred_value_oxygen)),
+         range = c("[-2.64, 0.58]", "[-3.27, 0.63]", "[-3, 0.5]",
+                   "[-2.3, 0.55]","[-2.36, 0.59]","[-2.43, 1.17]",
+                   "[-2.41, 0.61]"))
+# if we square correlation value, it acts like R-square value based on the testing data set
+# shrinkage = (R2 from training data) - (R2 from testing data)
+# shrinkage of 10% or less should not be a problem, but if it's more than 50% would be worrisome
+# we want mean of residuals to be close to zero
+# we want sd(residuals) of testing data to be close to the sd(residuals) from fitted model (training data)
+```
+
+```{r}
+# residual plot for testing data
+ggplot(test, aes(x = pred_value_aluminum, y = residual_aluminum)) +
+  geom_point() +
+  geom_smooth(se=FALSE)
+ggplot(test, aes(x = pred_value_carbon, y = residual_carbon)) +
+  geom_point() +
+  geom_smooth(se=FALSE)
+ggplot(test, aes(x = pred_value_calcium, y = residual_calcium)) +
+  geom_point() +
+  geom_smooth(se=FALSE)
+ggplot(test, aes(x = pred_value_iron, y = residual_iron)) +
+  geom_point() +
+  geom_smooth(se=FALSE)
+ggplot(test, aes(x = pred_value_magnesium, y = residual_magnesium)) +
+  geom_point() +
+  geom_smooth(se=FALSE)
+ggplot(test, aes(x = pred_value_nitrogen, y = residual_nitrogen)) +
+  geom_point() +
+  geom_smooth(se=FALSE)
+ggplot(test, aes(x = pred_value_oxygen, y = residual_oxygen)) +
+  geom_point() +
+  geom_smooth(se=FALSE)
+
+for (col in cols) {
+  plot(models[[col]])} # residual plots for training data
+# the mean of residuals should be zero and its forced to be zero on the training data set, but it might not zero for testing data but its gonna be better if its zero.
+```
+
+<Personal Reference>
+Multiple R-squared of 0.000366 indicates that the line (linear regression) does not follow the movements of of the index(data points). Spectra is not a good predictor of abundance oh h.https://www.investopedia.com/terms/r/r-squared.asp
+
+Linear relationship between x and y: https://www.oreilly.com/library/view/practical-statistics-for/9781491952955/ch04.html
+
+Residuals: https://www.qualtrics.com/support/stats-iq/analyses/regression-guides/interpreting-residual-plots-improve-regression/
